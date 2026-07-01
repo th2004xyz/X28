@@ -1,11 +1,14 @@
-"""数据抓取层: X API v2 优先，自动降级到 twiiit.com (Nitter 智能网关) RSS。
+"""数据抓取层: X API v2 优先，自动降级到多个 Nitter 网关 RSS。
 
 可靠性改进:
   - TTL 内存缓存 (默认 60s)，减少重复刷新的资源消耗
-  - @retry 装饰器对 RSS 抓取做指数退避重试
+  - @retry 装饰器对单网关抓取做指数退避重试
+  - 多网关自动轮询降级 (twiiit.com + 多个直连实例)
+  - 失败网关短期冷却 (默认 5 分钟)，避免反复尝试已知挂掉的实例
   - 返回标准化 Tweet dataclass
 """
 
+import os
 import time
 import logging
 import urllib.parse
@@ -23,10 +26,24 @@ from .models import Tweet
 log = logging.getLogger("x28.scraper")
 
 
-class TwitterScraper:
-    """优先使用官方 X API v2；失败或未配置时使用 twiiit.com RSS。
+# 默认 Nitter 网关列表（可被 .env 的 NITTER_GATEWAYS 覆盖，逗号分隔）
+# twiiit.com 是智能网关会自动重定向到存活实例，放第一位
+DEFAULT_NITTER_GATEWAYS = [
+    "https://twiiit.com",
+    "https://nitter.poast.org",
+    "https://nitter.net",
+    "https://nitter.cz",
+    "https://nitter.privacydev.net",
+    "https://bird.trom.tf",
+    "https://nitter.fdn.fr",
+]
 
-    twiiit.com 会自动重定向到当前存活的 Nitter 实例，无需维护实例列表。
+
+class TwitterScraper:
+    """优先使用官方 X API v2；失败或未配置时按顺序轮询多个 Nitter 网关。
+
+    twiiit.com 是智能网关会自动重定向到存活实例，放第一位兜底；
+    其余为直连 Nitter 实例，作为后备。失败网关会被短期冷却避免反复尝试。
     """
 
     HEADERS = {
@@ -36,11 +53,26 @@ class TwitterScraper:
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
     }
 
-    def __init__(self, bearer_token: str = "", cache_ttl: float = 60.0):
+    # 失败网关冷却时间（秒），冷却期内跳过该网关
+    _GATEWAY_COOLDOWN = 300.0
+
+    def __init__(self, bearer_token: str = "", cache_ttl: float = 60.0,
+                 gateways: Optional[List[str]] = None):
         self.bearer_token = (bearer_token or "").strip()
         self._cache_ttl = cache_ttl
         # key -> (timestamp, tweets)
         self._cache: dict = {}
+        # 网关列表（可由 .env 的 NITTER_GATEWAYS 覆盖）
+        env_gw = os.getenv("NITTER_GATEWAYS", "").strip()
+        if gateways:
+            self.gateways = list(gateways)
+        elif env_gw:
+            self.gateways = [g.strip() for g in env_gw.split(",") if g.strip()]
+        else:
+            self.gateways = list(DEFAULT_NITTER_GATEWAYS)
+        # 网关冷却记录: base_url -> 冷却到期时间戳
+        self._gw_cooldown: dict = {}
+        log.info("Nitter 网关列表: %s", self.gateways)
 
     # ---------- 缓存 ----------
     def _cache_get(self, key: str) -> Optional[List[Tweet]]:
@@ -133,20 +165,62 @@ class TwitterScraper:
             ))
         return tweets
 
-    # ---------- Nitter / twiiit.com ----------
+    # ---------- Nitter 多网关轮询 ----------
     def _nitter_user(self, username: str) -> List[Tweet]:
-        url = f"https://twiiit.com/{username}/rss"
-        return self._fetch_and_parse_rss(url, default_username=username)
+        path = f"{username}/rss"
+        return self._fetch_with_failover(path, default_username=username)
 
     def _nitter_search(self, query: str) -> List[Tweet]:
         q = urllib.parse.quote(query)
-        url = f"https://twiiit.com/search/rss?f=tweets&q={q}"
-        return self._fetch_and_parse_rss(url, default_username=query)
+        path = f"search/rss?f=tweets&q={q}"
+        return self._fetch_with_failover(path, default_username=query)
 
-    @retry(times=3, delay=1.5, backoff=2.0,
+    def _fetch_with_failover(self, path: str, default_username: str = "") -> List[Tweet]:
+        """按顺序轮询所有网关，第一个成功的就用，全部失败才抛聚合错误。
+
+        失败网关会被标记冷却 _GATEWAY_COOLDOWN 秒，冷却期内跳过。
+        """
+        errors = []
+        now = time.time()
+        # 清理已过期的冷却记录
+        expired = [g for g, t in self._gw_cooldown.items() if t <= now]
+        for g in expired:
+            del self._gw_cooldown[g]
+
+        for base in self.gateways:
+            if base in self._gw_cooldown:
+                log.debug("跳过冷却中的网关: %s", base)
+                continue
+            url = f"{base.rstrip('/')}/{path.lstrip('/')}"
+            try:
+                tweets = self._fetch_and_parse_rss(url, default_username)
+                if tweets:
+                    log.info("网关 %s 抓取成功 (%d 条)", base, len(tweets))
+                    return tweets
+                # 解析成功但 0 条：可能是新账号或网关返回空，仍标记冷却以免反复空转
+                log.info("网关 %s 返回 0 条推文", base)
+                self._gw_cooldown[base] = now + self._GATEWAY_COOLDOWN
+                errors.append(f"{base}: 0 条推文")
+            except Exception as e:
+                log.warning("网关 %s 失败: %s", base, e)
+                self._gw_cooldown[base] = now + self._GATEWAY_COOLDOWN
+                errors.append(f"{base}: {e}")
+
+        # 所有网关都失败
+        raise Exception(
+            "所有 Nitter 网关均失败：\n" + "\n".join(f"  • {e}" for e in errors)
+            + "\n\n建议：\n"
+            "  • 确认网络可访问海外站点（如需科学上网请开启）\n"
+            "  • 检查 .env 中的代理设置\n"
+            "  • 或配置官方 X_BEARER_TOKEN 使用官方 API\n"
+            "  • 可在 .env 中自定义 NITTER_GATEWAYS=网关1,网关2"
+        )
+
+    @retry(times=2, delay=1.0, backoff=2.0,
            exceptions=(requests.exceptions.ConnectionError,
                        requests.exceptions.Timeout))
     def _fetch_and_parse_rss(self, url: str, default_username: str = "") -> List[Tweet]:
+        """对单个网关 URL 抓取并解析 RSS，内部带轻量重试。"""
         try:
             resp = requests.get(url, headers=self.HEADERS,
                                 timeout=12, allow_redirects=True)
@@ -154,11 +228,11 @@ class TwitterScraper:
                 raise Exception(f"HTTP {resp.status_code}")
             return self._parse_rss(resp.text, default_username)
         except requests.exceptions.ProxyError as e:
-            raise Exception(f"代理连接失败，请检查代理设置或关闭代理后重试。({e})")
+            raise Exception(f"代理连接失败 ({e})")
         except requests.exceptions.ConnectionError as e:
-            raise Exception(f"网络连接错误，请检查网络是否畅通。({e})")
+            raise Exception(f"连接错误 ({e})")
         except requests.exceptions.Timeout:
-            raise Exception("请求超时，请确认网络可访问 twiiit.com，可能需要科学上网。")
+            raise Exception("请求超时")
         except Exception as e:
             raise Exception(str(e))
 
