@@ -1,10 +1,10 @@
 """X28 - X 平台内容运营辅助工具入口。
 
-第二阶段重构后，业务逻辑已拆分到 x28 包:
-  - x28.config   配色 / 日志 / 代理修复 / .env
-  - x28.utils    辅助函数 / 重试 / 安全模板
-  - x28.core     数据模型 / 持久化 / 抓取 / AI
-  - x28.ui        CustomTkinter 主界面
+第二阶段重构后，业务逻辑已拆分到 x28_app 包:
+  - x28_app.config   配色 / 日志 / 代理修复 / .env
+  - x28_app.utils    辅助函数 / 重试 / 安全模板
+  - x28_app.core     数据模型 / 持久化 / 抓取 / AI
+  - x28_app.ui        CustomTkinter 主界面
 
 运行:  python main.py
 """
@@ -13,9 +13,9 @@ import os
 import sys
 import logging
 
-# 导入 x28 包即触发: fix_proxy_env + load_dotenv + setup_logging
-import x28  # noqa: F401  (副作用: 初始化日志与代理)
-from x28.ui import AppGUI
+# 导入 x28_app 包即触发: fix_proxy_env + load_dotenv + setup_logging
+import x28_app  # noqa: F401  (副作用: 初始化日志与代理)
+from x28_app.ui import AppGUI
 
 log = logging.getLogger("x28.main")
 
@@ -28,7 +28,7 @@ def ensure_runtime_dirs() -> None:
 
 def main() -> int:
     ensure_runtime_dirs()
-    log.info("X28 启动 (v%s)", x28.__version__)
+    log.info("X28 启动 (v%s)", x28_app.__version__)
     try:
         app = AppGUI()
         app.mainloop()
