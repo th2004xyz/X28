@@ -2,9 +2,9 @@
 
 模块组成:
   - config:  主题配色、日志、代理修复、.env 加载
-  - utils:   通用辅助函数、重试装饰器、安全模板替换
+  - utils:   通用辅助函数、重试装饰器、安全模板替换、keyring 凭证
   - core:    数据模型、DataManager、TwitterScraper、AIGenerator
-  - ui:      AppGUI（CustomTkinter 主界面）
+  - ui:      AppGUI（CustomTkinter 主界面）、ConfigWizard（配置向导）
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"

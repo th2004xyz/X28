@@ -1,11 +1,16 @@
 """数据管理层: 账号/关键词列表与 Prompt 模板的本地 JSON 持久化。
 
 读写 data/config.json 与 data/prompts.json。
+
+Prompt 模板支持两种存储格式（向后兼容）:
+  旧格式: {"name1": "content1", ...}
+  新格式: {"name1": {"content": "...", "version": "1.0", "updated_at": "...", "description": "..."}, ...}
 """
 
 import os
 import json
 import logging
+from datetime import datetime
 from typing import List
 
 log = logging.getLogger("x28.data")
@@ -74,6 +79,9 @@ class DataManager:
         ),
     }
 
+    # Prompt 分享/导入文件的标准 schema 版本
+    PROMPT_FILE_SCHEMA = "x28.prompts/v1"
+
     def __init__(self, data_dir: str = "data"):
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
@@ -137,7 +145,23 @@ class DataManager:
             self._save_config()
             log.info("删除关键词: %s", kw)
 
-    # ---- Prompt 模板 ----
+    # ---- Prompt 模板（带版本与导入/导出） ----
+    @staticmethod
+    def _normalize_prompt(value) -> dict:
+        """把存储值统一成 dict 格式（兼容旧的 str 格式）。"""
+        if isinstance(value, str):
+            return {"content": value, "version": "1.0", "updated_at": "",
+                    "description": ""}
+        if isinstance(value, dict):
+            return {
+                "content": value.get("content", ""),
+                "version": value.get("version", "1.0"),
+                "updated_at": value.get("updated_at", ""),
+                "description": value.get("description", ""),
+            }
+        return {"content": "", "version": "1.0", "updated_at": "",
+                "description": ""}
+
     def _load_prompts(self) -> None:
         if os.path.exists(self.prompts_path):
             try:
@@ -159,9 +183,53 @@ class DataManager:
         except Exception as e:
             log.error("保存 prompts.json 失败: %s", e)
 
-    def save_prompt(self, name: str, content: str) -> None:
-        self.prompts[name.strip()] = content
+    def save_prompt(self, name: str, content: str,
+                    version: str = None, description: str = None) -> None:
+        """保存 Prompt 模板，自动维护版本号与时间戳。
+
+        Args:
+            name:        模板名
+            content:     模板正文
+            version:     显式指定版本号；None 时自动递增
+            description: 可选描述
+        """
+        name = name.strip()
+        existing = self._normalize_prompt(self.prompts.get(name))
+
+        # 版本号维护
+        if version is None:
+            version = self._bump_version(existing.get("version", "1.0"),
+                                         existing.get("content", ""),
+                                         content)
+        if description is None:
+            description = existing.get("description", "")
+
+        self.prompts[name] = {
+            "content": content,
+            "version": version,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "description": description,
+        }
         self._save_prompts()
+        log.info("保存 Prompt「%s」v%s", name, version)
+
+    @staticmethod
+    def _bump_version(old_ver: str, old_content: str, new_content: str) -> str:
+        """内容变化时自动递增次版本号（major.minor → major.minor+1）。"""
+        # 首次保存（无旧内容）→ 1.0
+        if not old_content:
+            return "1.0"
+        if not old_ver:
+            return "1.0"
+        try:
+            major, minor = old_ver.split(".")
+            major, minor = int(major), int(minor)
+        except (ValueError, AttributeError):
+            return "1.0"
+        # 内容未变 → 不递增；变化了 → minor +1
+        if old_content.strip() == (new_content or "").strip():
+            return old_ver
+        return f"{major}.{minor + 1}"
 
     def delete_prompt(self, name: str) -> None:
         if name in self.prompts:
@@ -172,4 +240,80 @@ class DataManager:
         return list(self.prompts.keys())
 
     def get_prompt(self, name: str) -> str:
-        return self.prompts.get(name, "")
+        """返回 Prompt 正文（兼容新旧存储格式）。"""
+        return self._normalize_prompt(self.prompts.get(name)).get("content", "")
+
+    def get_prompt_meta(self, name: str) -> dict:
+        """返回 Prompt 完整元数据 dict（content/version/updated_at/description）。"""
+        return self._normalize_prompt(self.prompts.get(name))
+
+    # ---- 导入 / 导出 / 分享 ----
+    def export_prompts(self, names: List[str] = None) -> dict:
+        """导出指定 Prompt（默认全部）为可分享 JSON 结构。
+
+        Returns:
+            {"schema": "x28.prompts/v1", "exported_at": "...", "prompts": {...}}
+        """
+        names = names or self.get_prompt_names()
+        out = {}
+        for name in names:
+            if name in self.prompts:
+                meta = self._normalize_prompt(self.prompts[name])
+                out[name] = meta
+        return {
+            "schema": self.PROMPT_FILE_SCHEMA,
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "prompts": out,
+        }
+
+    def export_prompts_to_file(self, file_path: str,
+                               names: List[str] = None) -> int:
+        """导出到 JSON 文件，返回导出条数。"""
+        data = self.export_prompts(names)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        log.info("导出 %d 个 Prompt 到 %s", len(data["prompts"]), file_path)
+        return len(data["prompts"])
+
+    def import_prompts_from_file(self, file_path: str,
+                                  overwrite: bool = False) -> tuple:
+        """从 JSON 文件导入 Prompt 模板。
+
+        Args:
+            file_path: 导入文件路径
+            overwrite: True=同名覆盖；False=同名追加 _imported 后缀
+
+        Returns:
+            (imported_count, skipped_count)
+        """
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 兼容两种导入格式：完整 schema 包 / 裸 {name: content}
+        if isinstance(data, dict) and data.get("schema") == self.PROMPT_FILE_SCHEMA:
+            prompts_data = data.get("prompts", {})
+        else:
+            prompts_data = data
+
+        imported, skipped = 0, 0
+        for name, value in prompts_data.items():
+            meta = self._normalize_prompt(value)
+            target_name = name
+            if not overwrite and name in self.prompts:
+                # 同名且不覆盖 → 追加后缀
+                target_name = f"{name} (导入)"
+                if target_name in self.prompts:
+                    skipped += 1
+                    continue
+            self.prompts[target_name] = meta
+            imported += 1
+
+        if imported:
+            self._save_prompts()
+        log.info("导入完成: %d 成功, %d 跳过", imported, skipped)
+        return imported, skipped
+
+    def share_prompt_to_json(self, name: str) -> str:
+        """导出单个 Prompt 为可分享 JSON 字符串（便于复制/发送）。"""
+        data = self.export_prompts([name])
+        return json.dumps(data, indent=2, ensure_ascii=False)
