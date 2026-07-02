@@ -22,6 +22,8 @@ import pyperclip
 from ..config import COLORS
 from ..core import DataManager, TwitterScraper, AIGenerator, Tweet
 from ..utils.helpers import generate_letter_avatar, safe_format
+from ..utils.secrets import get_secret
+from .wizard import ConfigWizard
 
 log = logging.getLogger("x28.gui")
 
@@ -37,20 +39,20 @@ class AppGUI(ctk.CTk):
 
         provider = os.getenv("LLM_PROVIDER", "gemini").lower()
         if provider == "openai":
-            ai_key = os.getenv("OPENAI_API_KEY", "")
+            ai_key = get_secret("OPENAI_API_KEY")
             ai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         elif provider == "anthropic":
-            ai_key = os.getenv("ANTHROPIC_API_KEY", "")
+            ai_key = get_secret("ANTHROPIC_API_KEY")
             ai_model = os.getenv("ANTHROPIC_MODEL", "claude-5-fable")
         else:
             provider = "gemini"
-            ai_key = os.getenv("GEMINI_API_KEY", "")
+            ai_key = get_secret("GEMINI_API_KEY")
             ai_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
         self.ai_generator = AIGenerator(
             provider=provider, api_key=ai_key, model=ai_model,
             base_url=os.getenv("OPENAI_BASE_URL", ""))
-        self.scraper = TwitterScraper(bearer_token=os.getenv("X_BEARER_TOKEN", ""))
+        self.scraper = TwitterScraper(bearer_token=get_secret("X_BEARER_TOKEN"))
 
         # ---- 运行时状态 ----
         self.monitor_mode = "账号"       # "账号" | "关键词"
@@ -61,6 +63,18 @@ class AppGUI(ctk.CTk):
         self.active_item = None           # 当前选中的账号或关键词
         self.ai_model_name = ai_model
         self.ai_provider = provider
+
+        # 自动刷新状态
+        self._auto_refresh_minutes = 0   # 0=关闭
+        self._auto_refresh_after_id = None  # 当前 after 调度 ID
+        self._seen_tweet_keys: set = set()  # 已通知过的推文 key
+
+        # plyer 通知模块（按需导入，可能未安装）
+        try:
+            from plyer import notification as _notif  # type: ignore
+            self._notif_backend = _notif
+        except Exception:
+            self._notif_backend = None
 
         self._setup_window()
         self._build_ui()
@@ -101,6 +115,7 @@ class AppGUI(ctk.CTk):
         hf.grid_columnconfigure(0, weight=1)
         hf.grid_columnconfigure(1, weight=0)
         hf.grid_columnconfigure(2, weight=0)
+        hf.grid_columnconfigure(3, weight=0)
         hf.grid_rowconfigure(0, weight=1)
 
         logo = ctk.CTkLabel(
@@ -130,7 +145,52 @@ class AppGUI(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             corner_radius=6,
             command=self._refresh_current)
-        self.refresh_btn.grid(row=0, column=2, padx=20)
+        self.refresh_btn.grid(row=0, column=2, padx=(20, 6))
+
+        self.settings_btn = ctk.CTkButton(
+            hf, text="⚙️", width=42, height=32,
+            fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
+            border_color=COLORS["border"], border_width=1,
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=14),
+            corner_radius=6,
+            command=self._open_settings)
+        self.settings_btn.grid(row=0, column=3, padx=(0, 14))
+
+    def _open_settings(self):
+        """重新打开配置向导，保存后重启 AI / Scraper 以应用新凭证。"""
+        wizard = ConfigWizard(parent=self)
+        self.wait_window(wizard)
+        if wizard.result:
+            self._reload_credentials()
+            messagebox.showinfo("已保存", "配置已更新并生效。", parent=self)
+
+    def _reload_credentials(self):
+        """从 keyring / .env 重新读取凭证并重建 AI 与 Scraper。"""
+        provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+        if provider == "openai":
+            ai_key = get_secret("OPENAI_API_KEY")
+            ai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        elif provider == "anthropic":
+            ai_key = get_secret("ANTHROPIC_API_KEY")
+            ai_model = os.getenv("ANTHROPIC_MODEL", "claude-5-fable")
+        else:
+            provider = "gemini"
+            ai_key = get_secret("GEMINI_API_KEY")
+            ai_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+        self.ai_generator = AIGenerator(
+            provider=provider, api_key=ai_key, model=ai_model,
+            base_url=os.getenv("OPENAI_BASE_URL", ""))
+        self.scraper = TwitterScraper(bearer_token=get_secret("X_BEARER_TOKEN"))
+
+        self.ai_provider = provider
+        self.ai_model_name = ai_model
+        # 更新状态栏引擎信息
+        if hasattr(self, "engine_lbl"):
+            self.engine_lbl.configure(
+                text=f"引擎: {provider.upper()} / {ai_model}")
+            self._set_status(f"已切换引擎: {provider.upper()} / {ai_model}")
 
     # ----- 三栏主区域 -----
     def _build_main_area(self):
@@ -258,6 +318,8 @@ class AppGUI(ctk.CTk):
         self.monitor_mode = val
         items = self._current_items()
         self.active_item = items[0] if items else None
+        # 切换模式 → 重置新推文基线，避免误报
+        self._seen_tweet_keys.clear()
         self._refresh_side_list()
         if self.active_item:
             self._load_tweets_async(self.active_item)
@@ -266,6 +328,8 @@ class AppGUI(ctk.CTk):
 
     def _select_item(self, item):
         self.active_item = item
+        # 切换账号 → 重置新推文基线，避免误报
+        self._seen_tweet_keys.clear()
         self._refresh_side_list()
         self._load_tweets_async(item)
 
@@ -320,7 +384,8 @@ class AppGUI(ctk.CTk):
         self._tweet_panel_frame.grid(row=0, column=1, sticky="nsew", padx=6)
         self._tweet_panel_frame.grid_rowconfigure(0, weight=0)
         self._tweet_panel_frame.grid_rowconfigure(1, weight=0)
-        self._tweet_panel_frame.grid_rowconfigure(2, weight=1)
+        self._tweet_panel_frame.grid_rowconfigure(2, weight=0)
+        self._tweet_panel_frame.grid_rowconfigure(3, weight=1)
         self._tweet_panel_frame.grid_columnconfigure(0, weight=1)
 
         self.tweet_panel_title = ctk.CTkLabel(
@@ -343,14 +408,108 @@ class AppGUI(ctk.CTk):
         self.tweet_mode_seg.set("📡 自动抓取")
         self.tweet_mode_seg.grid(row=1, column=0, padx=10, pady=(0, 6), sticky="ew")
 
+        # 搜索 / 过滤 / 排序栏
+        self._build_filter_bar()
+
         self.tweets_scroll = ctk.CTkScrollableFrame(
             self._tweet_panel_frame, fg_color="transparent",
             scrollbar_button_color=COLORS["border"],
             scrollbar_button_hover_color=COLORS["card_hover"])
-        self.tweets_scroll.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        self.tweets_scroll.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 8))
         self.tweets_scroll.grid_columnconfigure(0, weight=1)
 
+        # 推文缓存：原始列表 + 过滤后的渲染列表
+        self._all_tweets: list = []
+        self._filter_query = ""
+        self._sort_mode = "time"  # time | likes | retweets
+
         self._build_manual_input_panel(self._tweet_panel_frame)
+
+    def _build_filter_bar(self):
+        """推文列表上方的搜索框 + 排序按钮栏。"""
+        fb = ctk.CTkFrame(self._tweet_panel_frame, fg_color="transparent")
+        fb.grid(row=2, column=0, padx=10, pady=(0, 6), sticky="ew")
+        fb.grid_columnconfigure(0, weight=1)
+        fb.grid_columnconfigure(1, weight=0)
+
+        self.search_entry = ctk.CTkEntry(
+            fb, placeholder_text="🔍  过滤推文（作者/关键词/正文）",
+            fg_color=COLORS["input"], border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+            placeholder_text_color=COLORS["text_muted"],
+            font=ctk.CTkFont(size=11),
+            height=30, corner_radius=6)
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.search_entry.bind("<KeyRelease>", self._on_search_change)
+
+        self.sort_seg = ctk.CTkSegmentedButton(
+            fb, values=["时间", "点赞", "转推"],
+            command=self._on_sort_change,
+            fg_color=COLORS["input"],
+            selected_color=COLORS["accent"],
+            selected_hover_color=COLORS["accent_hover"],
+            unselected_color=COLORS["input"],
+            unselected_hover_color=COLORS["card_hover"],
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=10, weight="bold"),
+            height=30)
+        self.sort_seg.set("时间")
+        self.sort_seg.grid(row=0, column=1)
+
+    def _on_search_change(self, event=None):
+        """搜索框输入变化时实时过滤推文。"""
+        self._filter_query = self.search_entry.get().strip().lower()
+        self._apply_filter_and_render()
+
+    def _on_sort_change(self, val):
+        """排序模式切换。"""
+        self._sort_mode = {"时间": "time", "点赞": "likes", "转推": "retweets"}.get(val, "time")
+        self._apply_filter_and_render()
+
+    def _apply_filter_and_render(self):
+        """根据当前搜索词与排序模式重新渲染推文列表。"""
+        # 先取消当前选中态（避免引用了已销毁的卡片）
+        if self.selected_card and not self.selected_card.winfo_exists():
+            self.selected_card = None
+
+        for w in self.tweets_scroll.winfo_children():
+            w.destroy()
+
+        tweets = list(self._all_tweets)
+        # 关键词过滤
+        if self._filter_query:
+            def _match(t: Tweet) -> bool:
+                q = self._filter_query
+                return (q in (t.text or "").lower()
+                        or q in (t.username or "").lower()
+                        or q in (t.display_name or "").lower())
+            tweets = [t for t in tweets if _match(t)]
+
+        # 排序
+        if self._sort_mode == "likes":
+            tweets.sort(key=lambda t: t.likes, reverse=True)
+        elif self._sort_mode == "retweets":
+            tweets.sort(key=lambda t: t.retweets, reverse=True)
+        else:  # time: 默认顺序已经是按时间倒序（RSS 顺序），保持原样
+            pass
+
+        if not tweets:
+            tip = ("🔍  无匹配推文\n换个关键词试试"
+                   if self._filter_query
+                   else "⚠  该账号暂无可解析的推文")
+            ctk.CTkLabel(
+                self.tweets_scroll, text=tip,
+                font=ctk.CTkFont(size=12),
+                text_color=COLORS["text_secondary"],
+                justify="center").grid(row=0, column=0, pady=40)
+            self._set_status(f"过滤后 0 条推文")
+            return
+
+        for i, t in enumerate(tweets):
+            self._build_tweet_card(i, t)
+
+        suffix = f"（过滤 {len(tweets)}/{len(self._all_tweets)}）" if self._filter_query else ""
+        self._set_status(f"已显示 {len(tweets)} 条{suffix}")
 
     def _build_manual_input_panel(self, parent):
         self.manual_panel = ctk.CTkFrame(parent, fg_color="transparent")
@@ -420,12 +579,18 @@ class AppGUI(ctk.CTk):
     def _on_tweet_mode_change(self, val):
         if val == "✏️ 手动输入":
             self.tweets_scroll.grid_remove()
-            self.manual_panel.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 8))
+            # 手动模式下隐藏搜索/排序栏
+            if hasattr(self, "search_entry"):
+                self.search_entry.master.grid_remove()
+            self.manual_panel.grid(row=3, column=0, sticky="nsew", padx=4, pady=(0, 8))
             self.tweet_panel_title.configure(text="手动输入推文")
             self._set_status("手动输入模式：请从浏览器复制推文内容粘贴到下方")
         else:
             self.manual_panel.grid_remove()
-            self.tweets_scroll.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 8))
+            # 自动模式恢复搜索/排序栏
+            if hasattr(self, "search_entry"):
+                self.search_entry.master.grid()
+            self.tweets_scroll.grid(row=3, column=0, sticky="nsew", padx=6, pady=(0, 8))
             self.tweet_panel_title.configure(text="推文监控面板")
             if self.active_item:
                 self._set_status(f"自动抓取模式：正在加载 {self.active_item}")
@@ -504,15 +669,18 @@ class AppGUI(ctk.CTk):
         pm_top.grid_columnconfigure(1, weight=0)
         pm_top.grid_columnconfigure(2, weight=0)
         pm_top.grid_columnconfigure(3, weight=0)
+        pm_top.grid_columnconfigure(4, weight=0)
+        pm_top.grid_columnconfigure(5, weight=0)
+        pm_top.grid_columnconfigure(6, weight=0)
 
-        pm_label = ctk.CTkLabel(
+        self.pm_label = ctk.CTkLabel(
             pm_top, text="Prompt 模板",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=COLORS["text_secondary"])
-        pm_label.grid(row=0, column=0, sticky="w")
+        self.pm_label.grid(row=0, column=0, sticky="w")
 
         self.save_prompt_btn = ctk.CTkButton(
-            pm_top, text="💾 保存", width=60, height=26,
+            pm_top, text="💾 保存", width=56, height=26,
             fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
             border_color=COLORS["border"], border_width=1,
             text_color=COLORS["text_primary"],
@@ -522,7 +690,7 @@ class AppGUI(ctk.CTk):
         self.save_prompt_btn.grid(row=0, column=1, padx=2)
 
         self.new_prompt_btn = ctk.CTkButton(
-            pm_top, text="＋ 新建", width=60, height=26,
+            pm_top, text="＋ 新建", width=56, height=26,
             fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
             border_color=COLORS["border"], border_width=1,
             text_color=COLORS["text_primary"],
@@ -532,14 +700,44 @@ class AppGUI(ctk.CTk):
         self.new_prompt_btn.grid(row=0, column=2, padx=2)
 
         self.del_prompt_btn = ctk.CTkButton(
-            pm_top, text="✕ 删除", width=60, height=26,
+            pm_top, text="✕ 删除", width=56, height=26,
             fg_color=COLORS["input"], hover_color=COLORS["accent"],
             border_color=COLORS["border"], border_width=1,
             text_color=COLORS["text_secondary"],
             font=ctk.CTkFont(size=11),
             corner_radius=5,
             command=self._delete_prompt)
-        self.del_prompt_btn.grid(row=0, column=3, padx=(2, 0))
+        self.del_prompt_btn.grid(row=0, column=3, padx=2)
+
+        self.import_prompt_btn = ctk.CTkButton(
+            pm_top, text="📥 导入", width=56, height=26,
+            fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
+            border_color=COLORS["border"], border_width=1,
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=11),
+            corner_radius=5,
+            command=self._import_prompts)
+        self.import_prompt_btn.grid(row=0, column=4, padx=2)
+
+        self.export_prompt_btn = ctk.CTkButton(
+            pm_top, text="📤 导出", width=56, height=26,
+            fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
+            border_color=COLORS["border"], border_width=1,
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=11),
+            corner_radius=5,
+            command=self._export_prompts)
+        self.export_prompt_btn.grid(row=0, column=5, padx=2)
+
+        self.share_prompt_btn = ctk.CTkButton(
+            pm_top, text="🔗 分享", width=56, height=26,
+            fg_color=COLORS["input"], hover_color=COLORS["card_hover"],
+            border_color=COLORS["border"], border_width=1,
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=11),
+            corner_radius=5,
+            command=self._share_prompt)
+        self.share_prompt_btn.grid(row=0, column=6, padx=(2, 0))
 
         names = self.data_manager.get_prompt_names()
         self._current_prompt_name = names[0] if names else ""
@@ -660,6 +858,7 @@ class AppGUI(ctk.CTk):
         sb.grid_propagate(False)
         sb.grid_columnconfigure(0, weight=1)
         sb.grid_columnconfigure(1, weight=0)
+        sb.grid_columnconfigure(2, weight=0)
         sb.grid_rowconfigure(0, weight=1)
 
         self.status_lbl = ctk.CTkLabel(
@@ -668,11 +867,35 @@ class AppGUI(ctk.CTk):
             text_color=COLORS["text_muted"])
         self.status_lbl.grid(row=0, column=0, padx=14, sticky="w")
 
-        engine_info = f"引擎: {self.ai_provider.upper()} / {self.ai_model_name}"
+        # 自动刷新开关
+        auto_f = ctk.CTkFrame(sb, fg_color="transparent")
+        auto_f.grid(row=0, column=1, padx=4, sticky="e")
         ctk.CTkLabel(
+            auto_f, text="⏱ 自动:",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_muted"]).grid(row=0, column=0, padx=(0, 4))
+        self.auto_refresh_menu = ctk.CTkOptionMenu(
+            auto_f,
+            values=["关闭", "15分", "30分", "60分"],
+            command=self._on_auto_refresh_change,
+            fg_color=COLORS["input"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            dropdown_fg_color=COLORS["panel"],
+            dropdown_hover_color=COLORS["card_hover"],
+            text_color=COLORS["text_primary"],
+            dropdown_text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(size=11),
+            width=72, height=22)
+        self.auto_refresh_menu.set("关闭")
+        self.auto_refresh_menu.grid(row=0, column=1)
+
+        engine_info = f"引擎: {self.ai_provider.upper()} / {self.ai_model_name}"
+        self.engine_lbl = ctk.CTkLabel(
             sb, text=engine_info,
             font=ctk.CTkFont(size=11),
-            text_color=COLORS["text_muted"]).grid(row=0, column=1, padx=14, sticky="e")
+            text_color=COLORS["text_muted"])
+        self.engine_lbl.grid(row=0, column=2, padx=14, sticky="e")
 
     def _set_status(self, msg):
         self.status_lbl.configure(text=msg)
@@ -692,6 +915,19 @@ class AppGUI(ctk.CTk):
         content = self.data_manager.get_prompt(name)
         self.prompt_editor.delete("0.0", "end")
         self.prompt_editor.insert("0.0", content)
+        self._refresh_prompt_meta_label()
+
+    def _refresh_prompt_meta_label(self):
+        """在标签中显示当前 Prompt 的版本号与更新时间。"""
+        name = self._current_prompt_name
+        if not name:
+            self.pm_label.configure(text="Prompt 模板")
+            return
+        meta = self.data_manager.get_prompt_meta(name)
+        ver = meta.get("version", "1.0")
+        updated = meta.get("updated_at", "")
+        suffix = f"  (v{ver}" + (f" · {updated})" if updated else ")")
+        self.pm_label.configure(text=f"Prompt 模板{suffix}")
 
     def _save_prompt(self):
         name = self._current_prompt_name
@@ -699,6 +935,7 @@ class AppGUI(ctk.CTk):
         if not name or not content:
             return
         self.data_manager.save_prompt(name, content)
+        self._refresh_prompt_meta_label()
         self._set_status(f"Prompt「{name}」已保存 ✓")
 
     def _new_prompt(self):
@@ -732,6 +969,79 @@ class AppGUI(ctk.CTk):
             self._refresh_prompt_combo()
             self._set_status(f"已删除 Prompt「{name}」")
 
+    def _import_prompts(self):
+        """从 JSON 文件导入 Prompt 模板。"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择 Prompt JSON 文件",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            # 同名时询问覆盖策略
+            overwrite = messagebox.askyesno(
+                "导入模式",
+                "遇到同名的 Prompt 模板时：\n"
+                "  • 选「是」→ 覆盖同名模板\n"
+                "  • 选「否」→ 追加「(导入)」后缀保留两者\n\n"
+                "选择覆盖策略：",
+                parent=self)
+            imported, skipped = self.data_manager.import_prompts_from_file(
+                path, overwrite=overwrite)
+            self._refresh_prompt_combo()
+            msg = f"✓ 导入完成\n  成功: {imported} 个"
+            if skipped:
+                msg += f"\n  跳过(重名已存在): {skipped} 个"
+            messagebox.showinfo("导入结果", msg, parent=self)
+            self._set_status(f"已导入 {imported} 个 Prompt（跳过 {skipped}）")
+        except Exception as e:
+            log.warning("Prompt 导入失败: %s", e)
+            messagebox.showerror("导入失败", str(e), parent=self)
+
+    def _export_prompts(self):
+        """导出所有 Prompt 到 JSON 文件。"""
+        from tkinter import filedialog
+        from datetime import datetime as _dt
+        default_name = f"x28_prompts_{_dt.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            title="导出 Prompt 到 JSON 文件",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            count = self.data_manager.export_prompts_to_file(path)
+            messagebox.showinfo(
+                "导出成功",
+                f"✓ 已导出 {count} 个 Prompt 模板\n\n文件: {path}",
+                parent=self)
+            self._set_status(f"已导出 {count} 个 Prompt")
+        except Exception as e:
+            log.warning("Prompt 导出失败: %s", e)
+            messagebox.showerror("导出失败", str(e), parent=self)
+
+    def _share_prompt(self):
+        """导出当前 Prompt 为 JSON 字符串复制到剪贴板，便于分享。"""
+        name = self._current_prompt_name
+        if not name:
+            messagebox.showwarning("提示", "请先选择一个 Prompt 模板！", parent=self)
+            return
+        try:
+            json_str = self.data_manager.share_prompt_to_json(name)
+            pyperclip.copy(json_str)
+            messagebox.showinfo(
+                "分享已复制",
+                f"✓ Prompt「{name}」的分享 JSON 已复制到剪贴板！\n\n"
+                "你可以直接粘贴发送给他人，对方用「📥 导入」即可加载。",
+                parent=self)
+            self._set_status(f"已复制「{name}」分享 JSON 到剪贴板")
+        except Exception as e:
+            log.warning("Prompt 分享失败: %s", e)
+            messagebox.showerror("分享失败", str(e), parent=self)
+
     # ==========================================================================
     # 推文抓取与渲染
     # ==========================================================================
@@ -743,6 +1053,116 @@ class AppGUI(ctk.CTk):
         if self.active_item:
             # 用户主动刷新 → 强制绕过抓取缓存
             self._load_tweets_async(self.active_item, force_refresh=True)
+
+    # ---- 自动刷新 + 系统通知 ----
+    def _on_auto_refresh_change(self, val):
+        """自动刷新间隔切换。"""
+        minutes_map = {"关闭": 0, "15分": 15, "30分": 30, "60分": 60}
+        minutes = minutes_map.get(val, 0)
+        self._auto_refresh_minutes = minutes
+
+        # 取消之前的调度
+        if self._auto_refresh_after_id is not None:
+            self.after_cancel(self._auto_refresh_after_id)
+            self._auto_refresh_after_id = None
+
+        if minutes > 0:
+            self._set_status(f"⏱ 已开启自动刷新（每 {minutes} 分钟）")
+            log.info("开启自动刷新: 每 %d 分钟", minutes)
+            # 首次延迟 60s 启动，避免和初始加载冲突
+            self._auto_refresh_after_id = self.after(
+                60_000, self._auto_refresh_tick)
+        else:
+            self._set_status("已关闭自动刷新")
+            log.info("关闭自动刷新")
+
+    def _auto_refresh_tick(self):
+        """定时刷新的回调：抓取并检测新推文。"""
+        if self._auto_refresh_minutes <= 0:
+            return
+        if not self.active_item:
+            # 没有选中项，重新调度后跳过本轮
+            self._auto_refresh_after_id = self.after(
+                self._auto_refresh_minutes * 60_000, self._auto_refresh_tick)
+            return
+
+        log.info("自动刷新 tick: %s", self.active_item)
+
+        def _run():
+            try:
+                if self.monitor_mode == "账号":
+                    tweets = self.scraper.get_tweets_by_account(
+                        self.active_item, force_refresh=True)
+                else:
+                    tweets = self.scraper.get_tweets_by_keyword(
+                        self.active_item, force_refresh=True)
+                self.after(0, lambda: self._on_auto_refresh_done(tweets))
+            except Exception as e:
+                log.warning("自动刷新失败: %s", e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        # 重新调度下一次
+        self._auto_refresh_after_id = self.after(
+            self._auto_refresh_minutes * 60_000, self._auto_refresh_tick)
+
+    def _on_auto_refresh_done(self, tweets):
+        """自动刷新抓取完成的处理：检测新推文并通知。"""
+        if not tweets:
+            log.debug("自动刷新: 0 条推文")
+            return
+
+        # 推文唯一 key: 文本前 50 字 + 时间（无 ID 可用）
+        new_tweets = []
+        for t in tweets:
+            key = f"{t.text[:50]}|{t.time}"
+            if key not in self._seen_tweet_keys:
+                new_tweets.append(t)
+                self._seen_tweet_keys.add(key)
+
+        # 限制 _seen_tweet_keys 大小，避免无限增长
+        if len(self._seen_tweet_keys) > 500:
+            self._seen_tweet_keys = set(list(self._seen_tweet_keys)[-300:])
+
+        # 如果有新推文且首次加载已完成（_seen_tweet_keys 非空）→ 通知
+        # 首次抓取不通知（避免启动就一堆通知）
+        if new_tweets and self._seen_tweet_keys and len(new_tweets) < len(tweets):
+            count = len(new_tweets)
+            log.info("检测到 %d 条新推文", count)
+            self._notify_new_tweets(count, new_tweets[0])
+
+        # 同时刷新 UI（如果当前还在看这个账号）
+        if self.active_item:
+            self._render_tweets(tweets, self.active_item)
+
+    def _notify_new_tweets(self, count: int, sample_tweet: Tweet):
+        """弹出系统通知。plyer 不可用时回退到状态栏提示。"""
+        title = f"X28 · {self.active_item} 有 {count} 条新推文"
+        # 截取第一条推文前 80 字作为消息体
+        body = (sample_tweet.text[:80] + "…"
+                if len(sample_tweet.text) > 80
+                else sample_tweet.text)
+
+        if self._notif_backend is not None:
+            try:
+                self._notif_backend.notify(
+                    title=title,
+                    message=body,
+                    app_name="X28",
+                    timeout=10,
+                )
+                log.info("已弹出系统通知: %s", title)
+                return
+            except Exception as e:
+                log.warning("系统通知失败，回退到状态栏: %s", e)
+
+        # 回退: 状态栏 + 高亮标题
+        self._set_status(f"🔔 {title}")
+        # 闪烁窗口标题（CTk/Tkinter 的 bell）
+        try:
+            self.bell()
+        except Exception:
+            pass
 
     def _load_tweets_async(self, item, force_refresh: bool = False):
         mode_text = "账号" if self.monitor_mode == "账号" else "关键词"
@@ -778,6 +1198,13 @@ class AppGUI(ctk.CTk):
         threading.Thread(target=_run, daemon=True).start()
 
     def _render_tweets(self, tweets, item):
+        # 缓存原始列表用于过滤
+        self._all_tweets = list(tweets)
+        # 清空搜索框（新账号加载时重置过滤条件）
+        if hasattr(self, "search_entry"):
+            self.search_entry.delete(0, "end")
+        self._filter_query = ""
+
         for w in self.tweets_scroll.winfo_children():
             w.destroy()
 
